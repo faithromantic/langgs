@@ -556,6 +556,86 @@ renderCUDA(
 	}
 }
 
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderSemanticCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ semantic_features,
+	int semantic_dim,
+	const float* __restrict__ dL_dsemantic_image,
+	float* __restrict__ dL_dsemantic_features)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint32_t channel = block.group_index().z;
+	if (channel >= semantic_dim)
+		return;
+
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	float T = 1.0f;
+	const float dL_dpixel = inside ? dL_dsemantic_image[channel * H * W + pix_id] : 0.0f;
+
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			int coll_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			float2 xy = collected_xy[j];
+			float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			float4 con_o = collected_conic_opacity[j];
+			float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			float alpha = min(0.99f, con_o.w * exp(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			float test_T = T * (1 - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			const int global_id = collected_id[j];
+			atomicAdd(&(dL_dsemantic_features[global_id * semantic_dim + channel]), alpha * T * dL_dpixel);
+			T = test_T;
+		}
+	}
+}
+
 void BACKWARD::preprocess(
 	int P, int D, int M,
 	const float3* means3D,
@@ -654,4 +734,31 @@ void BACKWARD::render(
 		dL_dopacity,
 		dL_dcolors
 		);
+}
+
+void BACKWARD::render_semantic(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float2* means2D,
+	const float4* conic_opacity,
+	const float* semantic_features,
+	int semantic_dim,
+	const float* final_Ts,
+	const uint32_t* n_contrib,
+	const float* dL_dsemantic_image,
+	float* dL_dsemantic_features)
+{
+	dim3 semantic_grid(grid.x, grid.y, semantic_dim);
+	renderSemanticCUDA << <semantic_grid, block >> >(
+		ranges,
+		point_list,
+		W, H,
+		means2D,
+		conic_opacity,
+		semantic_features,
+		semantic_dim,
+		dL_dsemantic_image,
+		dL_dsemantic_features);
 }

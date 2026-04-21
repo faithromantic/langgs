@@ -60,6 +60,17 @@ namespace FORWARD
 		uint32_t* n_contrib,
 		const float* bg_color,
 		float* out_color);
+
+	void render_semantic(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* points_xy_image,
+		const float* semantic_features,
+		int semantic_dim,
+		const float4* conic_opacity,
+		float* out_semantic);
 	void filter_preprocess(int P, int M,
 		const float* means3D,
 		const glm::vec3* scales,

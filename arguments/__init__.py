@@ -75,7 +75,12 @@ class ModelParams(ParamGroup):
         self.add_opacity_dist = False
         self.add_cov_dist = False
         self.add_color_dist = False
-        
+        # ===== 新增：语义相关（LangSplat）=====
+        self.semantic_dim = 3
+        self.include_semantic = False
+        self.semantic_features_name = "language_features_dim3"
+        self.feature_level = 0
+
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -88,6 +93,8 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        # 语义可视化
+        self.render_semantic = False
         super().__init__(parser, "Pipeline Parameters")
 
 class OptimizationParams(ParamGroup):
@@ -151,6 +158,11 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        # ===== 新增：语义优化 =====
+        self.semantic_lr = 0.002
+        self.semantic_loss_weight = 1.0
+        self.freeze_rgb_branch = False
+        self.semantic_only = False
 
         super().__init__(parser, "Optimization Parameters")
 

@@ -57,6 +57,8 @@ class GaussianModel:
                  add_opacity_dist : bool = False,
                  add_cov_dist : bool = False,
                  add_color_dist : bool = False,
+                 semantic_dim : int = 3,
+                 add_semantic_dist : bool = False,
                  ):
 
         self.feat_dim = feat_dim
@@ -73,6 +75,9 @@ class GaussianModel:
         self.add_opacity_dist = add_opacity_dist
         self.add_cov_dist = add_cov_dist
         self.add_color_dist = add_color_dist
+        self.semantic_dim = semantic_dim
+        self.add_semantic_dist = add_semantic_dist
+        self.train_semantic = False
 
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
@@ -127,11 +132,19 @@ class GaussianModel:
             nn.Sigmoid()
         ).cuda()
 
+        self.semantic_dist_dim = 1 if self.add_semantic_dist else 0
+        self.mlp_semantic = nn.Sequential(
+            nn.Linear(feat_dim+3+self.semantic_dist_dim, feat_dim),
+            nn.ReLU(True),
+            nn.Linear(feat_dim, self.semantic_dim*self.n_offsets),
+        ).cuda()
+
 
     def eval(self):
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         self.mlp_color.eval()
+        self.mlp_semantic.eval()
         if self.appearance_dim > 0:
             self.embedding_appearance.eval()
         if self.use_feat_bank:
@@ -141,40 +154,107 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         self.mlp_color.train()
+        self.mlp_semantic.train()
         if self.appearance_dim > 0:
             self.embedding_appearance.train()
         if self.use_feat_bank:                   
             self.mlp_feature_bank.train()
 
     def capture(self):
-        return (
-            self._anchor,
-            self._offset,
-            self._local,
-            self._scaling,
-            self._rotation,
-            self._opacity,
-            self.max_radii2D,
-            self.denom,
-            self.optimizer.state_dict(),
-            self.spatial_lr_scale,
-        )
+        return {
+            "anchor": self._anchor.detach(),
+            "offset": self._offset.detach(),
+            "anchor_feat": self._anchor_feat.detach(),
+            "scaling": self._scaling.detach(),
+            "rotation": self._rotation.detach(),
+            "opacity": self._opacity.detach(),
+            "max_radii2D": self.max_radii2D.detach(),
+            "spatial_lr_scale": self.spatial_lr_scale,
+            "optimizer": self.optimizer.state_dict(),
+            "mlp_opacity": self.mlp_opacity.state_dict(),
+            "mlp_cov": self.mlp_cov.state_dict(),
+            "mlp_color": self.mlp_color.state_dict(),
+            "mlp_semantic": self.mlp_semantic.state_dict(),
+            "use_feat_bank": self.use_feat_bank,
+            "appearance_dim": self.appearance_dim,
+            "stats": {
+                "opacity_accum": self.opacity_accum.detach(),
+                "offset_gradient_accum": self.offset_gradient_accum.detach(),
+                "offset_denom": self.offset_denom.detach(),
+                "anchor_demon": self.anchor_demon.detach(),
+            },
+            "embedding_appearance": self.embedding_appearance.state_dict() if self.appearance_dim > 0 else None,
+            "mlp_feature_bank": self.mlp_feature_bank.state_dict() if self.use_feat_bank else None,
+        }
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._anchor, 
-        self._offset,
-        self._local,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if isinstance(model_args, dict):
+            self._anchor = nn.Parameter(model_args["anchor"].cuda().requires_grad_(True))
+            self._offset = nn.Parameter(model_args["offset"].cuda().requires_grad_(True))
+            self._anchor_feat = nn.Parameter(model_args["anchor_feat"].cuda().requires_grad_(True))
+            self._scaling = nn.Parameter(model_args["scaling"].cuda().requires_grad_(True))
+            self._rotation = nn.Parameter(model_args["rotation"].cuda().requires_grad_(True))
+            self._opacity = nn.Parameter(model_args["opacity"].cuda().requires_grad_(True))
+            self.max_radii2D = model_args["max_radii2D"].cuda()
+            self.spatial_lr_scale = model_args["spatial_lr_scale"]
+        else:
+            if len(model_args) == 10:
+                (
+                    anchor,
+                    offset,
+                    anchor_feat,
+                    scaling,
+                    rotation,
+                    opacity,
+                    max_radii2D,
+                    _legacy_offset_denom,
+                    opt_dict,
+                    self.spatial_lr_scale,
+                ) = model_args
+            else:
+                raise ValueError("Unsupported checkpoint format for GaussianModel.restore")
+
+            self._anchor = nn.Parameter(anchor.cuda().requires_grad_(True))
+            self._offset = nn.Parameter(offset.cuda().requires_grad_(True))
+            self._anchor_feat = nn.Parameter(anchor_feat.cuda().requires_grad_(True))
+            self._scaling = nn.Parameter(scaling.cuda().requires_grad_(True))
+            self._rotation = nn.Parameter(rotation.cuda().requires_grad_(True))
+            self._opacity = nn.Parameter(opacity.cuda().requires_grad_(True))
+            self.max_radii2D = max_radii2D.cuda()
+            model_args = {"optimizer": opt_dict, "stats": {}}
+
         self.training_setup(training_args)
-        self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+
+        if model_args.get("mlp_opacity") is not None:
+            self.mlp_opacity.load_state_dict(model_args["mlp_opacity"])
+        if model_args.get("mlp_cov") is not None:
+            self.mlp_cov.load_state_dict(model_args["mlp_cov"])
+        if model_args.get("mlp_color") is not None:
+            self.mlp_color.load_state_dict(model_args["mlp_color"])
+        if model_args.get("mlp_semantic") is not None:
+            try:
+                self.mlp_semantic.load_state_dict(model_args["mlp_semantic"])
+            except RuntimeError as exc:
+                print(f"Skipping semantic MLP restore due to incompatible shape: {exc}")
+        if self.use_feat_bank and model_args.get("mlp_feature_bank") is not None:
+            self.mlp_feature_bank.load_state_dict(model_args["mlp_feature_bank"])
+        if self.appearance_dim > 0 and model_args.get("embedding_appearance") is not None:
+            self.embedding_appearance.load_state_dict(model_args["embedding_appearance"])
+
+        stats = model_args.get("stats", {})
+        if stats.get("opacity_accum") is not None:
+            self.opacity_accum = stats["opacity_accum"].cuda()
+        if stats.get("offset_gradient_accum") is not None:
+            self.offset_gradient_accum = stats["offset_gradient_accum"].cuda()
+        if stats.get("offset_denom") is not None:
+            self.offset_denom = stats["offset_denom"].cuda()
+        if stats.get("anchor_demon") is not None:
+            self.anchor_demon = stats["anchor_demon"].cuda()
+
+        try:
+            self.optimizer.load_state_dict(model_args["optimizer"])
+        except ValueError as exc:
+            print(f"Skipping optimizer state restore due to parameter group mismatch: {exc}")
 
     def set_appearance(self, num_cameras):
         if self.appearance_dim > 0:
@@ -203,6 +283,10 @@ class GaussianModel:
     @property
     def get_color_mlp(self):
         return self.mlp_color
+
+    @property
+    def get_semantic_mlp(self):
+        return self.mlp_semantic
     
     @property
     def get_rotation(self):
@@ -274,6 +358,8 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        train_semantic = getattr(training_args, "train_semantic", False)
+        self.train_semantic = train_semantic
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -281,8 +367,6 @@ class GaussianModel:
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
-        
-        
         if self.use_feat_bank:
             l = [
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -326,6 +410,9 @@ class GaussianModel:
                 {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
             ]
 
+        if train_semantic:
+            l.append({'params': self.mlp_semantic.parameters(), 'lr': training_args.semantic_lr, "name": "mlp_semantic"})
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.anchor_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -350,6 +437,12 @@ class GaussianModel:
                                                     lr_final=training_args.mlp_color_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
+
+        if train_semantic:
+            self.mlp_semantic_scheduler_args = get_expon_lr_func(lr_init=training_args.semantic_lr,
+                                                        lr_final=training_args.semantic_lr,
+                                                        lr_delay_mult=1.0,
+                                                        max_steps=training_args.position_lr_max_steps)
         if self.use_feat_bank:
             self.mlp_featurebank_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_featurebank_lr_init,
                                                         lr_final=training_args.mlp_featurebank_lr_final,
@@ -364,6 +457,9 @@ class GaussianModel:
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         for param_group in self.optimizer.param_groups:
+            if not any(param.requires_grad for param in param_group["params"]):
+                param_group['lr'] = 0.0
+                continue
             if param_group["name"] == "offset":
                 lr = self.offset_scheduler_args(iteration)
                 param_group['lr'] = lr
@@ -378,6 +474,9 @@ class GaussianModel:
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_color":
                 lr = self.mlp_color_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "mlp_semantic":
+                lr = self.mlp_semantic_scheduler_args(iteration)
                 param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 lr = self.mlp_featurebank_scheduler_args(iteration)
@@ -603,8 +702,6 @@ class GaussianModel:
 
             all_xyz = self.get_anchor.unsqueeze(dim=1) + self._offset * self.get_scaling[:,:3].unsqueeze(dim=1)
             
-            # assert self.update_init_factor // (self.update_hierachy_factor**i) > 0
-            # size_factor = min(self.update_init_factor // (self.update_hierachy_factor**i), 1)
             size_factor = self.update_init_factor // (self.update_hierachy_factor**i)
             cur_size = self.voxel_size*size_factor
             
@@ -616,7 +713,6 @@ class GaussianModel:
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0)
 
 
-            ## split data for reducing peak memory calling
             use_chunk = True
             if use_chunk:
                 chunk_size = 4096
@@ -635,7 +731,7 @@ class GaussianModel:
 
             
             if candidate_anchor.shape[0] > 0:
-                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size # *0.05
+                new_scaling = torch.ones_like(candidate_anchor).repeat([1,2]).float().cuda()*cur_size
                 new_scaling = torch.log(new_scaling)
                 new_rotation = torch.zeros([candidate_anchor.shape[0], 4], device=candidate_anchor.device).float()
                 new_rotation[:,0] = 1.0
@@ -679,15 +775,13 @@ class GaussianModel:
 
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005):
-        # # adding anchors
-        grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
+        grads = self.offset_gradient_accum / self.offset_denom
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold*0.5).squeeze(dim=1)
         
         self.anchor_growing(grads_norm, grad_threshold, offset_mask)
         
-        # update offset_denom
         self.offset_denom[offset_mask] = 0
         padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
                                            dtype=torch.int32, 
@@ -700,12 +794,10 @@ class GaussianModel:
                                            device=self.offset_gradient_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
         
-        # # prune anchors
         prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
-        anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+        anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1)
+        prune_mask = torch.logical_and(prune_mask, anchors_mask)
         
-        # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
         offset_denom = offset_denom.view([-1, 1])
         del self.offset_denom
@@ -716,7 +808,6 @@ class GaussianModel:
         del self.offset_gradient_accum
         self.offset_gradient_accum = offset_gradient_accum
         
-        # update opacity accum 
         if anchors_mask.sum()>0:
             self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
             self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
@@ -734,7 +825,7 @@ class GaussianModel:
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
-    def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
+    def save_mlp_checkpoints(self, path, mode = 'split'):
         mkdir_p(os.path.dirname(path))
         if mode == 'split':
             self.mlp_opacity.eval()
@@ -751,6 +842,14 @@ class GaussianModel:
             color_mlp = torch.jit.trace(self.mlp_color, (torch.rand(1, self.feat_dim+3+self.color_dist_dim+self.appearance_dim).cuda()))
             color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             self.mlp_color.train()
+
+            self.mlp_semantic.eval()
+            semantic_mlp = torch.jit.trace(
+                self.mlp_semantic,
+                (torch.rand(1, self.feat_dim + 3 + self.semantic_dist_dim).cuda(),)
+            )
+            semantic_mlp.save(os.path.join(path, 'semantic_mlp.pt'))
+            self.mlp_semantic.train()
 
             if self.use_feat_bank:
                 self.mlp_feature_bank.eval()
@@ -770,6 +869,7 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'semantic_mlp': self.mlp_semantic.state_dict(),
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
                     'appearance': self.embedding_appearance.state_dict()
                     }, os.path.join(path, 'checkpoints.pth'))
@@ -778,6 +878,7 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'semantic_mlp': self.mlp_semantic.state_dict(),
                     'appearance': self.embedding_appearance.state_dict()
                     }, os.path.join(path, 'checkpoints.pth'))
             else:
@@ -785,16 +886,18 @@ class GaussianModel:
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'color_mlp': self.mlp_color.state_dict(),
+                    'semantic_mlp': self.mlp_semantic.state_dict(),
                     }, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
 
 
-    def load_mlp_checkpoints(self, path, mode = 'split'):#split or unite
+    def load_mlp_checkpoints(self, path, mode = 'split'):
         if mode == 'split':
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
+            self.mlp_semantic = torch.jit.load(os.path.join(path, 'semantic_mlp.pt')).cuda()
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_dim > 0:
@@ -804,6 +907,7 @@ class GaussianModel:
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
             self.mlp_color.load_state_dict(checkpoint['color_mlp'])
+            self.mlp_semantic.load_state_dict(checkpoint['semantic_mlp'])
             if self.use_feat_bank:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_dim > 0:

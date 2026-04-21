@@ -31,13 +31,34 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 
+def build_gaussian_model(dataset):
+    return GaussianModel(
+        dataset.feat_dim,
+        dataset.n_offsets,
+        dataset.voxel_size,
+        dataset.update_depth,
+        dataset.update_init_factor,
+        dataset.update_hierachy_factor,
+        dataset.use_feat_bank,
+        dataset.appearance_dim,
+        dataset.ratio,
+        dataset.add_opacity_dist,
+        dataset.add_cov_dist,
+        dataset.add_color_dist,
+        semantic_dim=dataset.semantic_dim,
+        add_semantic_dist=False,
+    )
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    semantic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "semantic")
     if not os.path.exists(render_path):
         os.makedirs(render_path)
     if not os.path.exists(gts_path):
         os.makedirs(gts_path)
+    if getattr(pipeline, "render_semantic", False) and not os.path.exists(semantic_path):
+        os.makedirs(semantic_path)
 
     name_list = []
     per_view_dict = {}
@@ -47,7 +68,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
         torch.cuda.synchronize(); t0 = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
+        render_pkg = render(
+            view,
+            gaussians,
+            pipeline,
+            background,
+            visible_mask=voxel_visible_mask,
+            render_semantic=getattr(pipeline, "render_semantic", False),
+        )
         torch.cuda.synchronize(); t1 = time.time()
         
         t_list.append(t1-t0)
@@ -57,6 +85,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        if getattr(pipeline, "render_semantic", False) and render_pkg["semantic_feature_image"] is not None:
+            semantic_latent = render_pkg["semantic_feature_image"].permute(1, 2, 0).detach().cpu().numpy()
+            np.save(os.path.join(semantic_path, '{0:05d}'.format(idx) + ".npy"), semantic_latent)
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()
@@ -67,8 +98,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
      
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        gaussians = build_gaussian_model(dataset)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
@@ -99,4 +129,5 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    pipeline_args = pipeline.extract(args)
+    render_sets(model.extract(args), args.iteration, pipeline_args, args.skip_train, args.skip_test)

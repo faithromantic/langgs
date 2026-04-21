@@ -37,6 +37,20 @@ namespace BACKWARD
 		float* dL_dopacity,
 		float* dL_dcolors);
 
+	void render_semantic(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* means2D,
+		const float4* conic_opacity,
+		const float* semantic_features,
+		int semantic_dim,
+		const float* final_Ts,
+		const uint32_t* n_contrib,
+		const float* dL_dsemantic_image,
+		float* dL_dsemantic_features);
+
 	void preprocess(
 		int P, int D, int M,
 		const float3* means,

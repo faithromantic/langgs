@@ -205,6 +205,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* means3D,
 	const float* shs,
 	const float* colors_precomp,
+	const float* semantic_precomp,
+	const int semantic_dim,
 	const float* opacities,
 	const float* scales,
 	const float scale_modifier,
@@ -216,6 +218,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* out_semantic,
 	int* radii,
 	bool debug)
 {
@@ -333,6 +336,21 @@ int CudaRasterizer::Rasterizer::forward(
 		out_color
 		), debug)
 
+	if (semantic_precomp != nullptr && semantic_dim > 0 && out_semantic != nullptr)
+	{
+		CHECK_CUDA(FORWARD::render_semantic(
+			tile_grid, block,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			semantic_precomp,
+			semantic_dim,
+			geomState.conic_opacity,
+			out_semantic
+			), debug)
+	}
+
 	return num_rendered;
 }
 
@@ -405,6 +423,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* means3D,
 	const float* shs,
 	const float* colors_precomp,
+	const float* semantic_precomp,
+	const int semantic_dim,
 	const float* scales,
 	const float scale_modifier,
 	const float* rotations,
@@ -418,10 +438,12 @@ void CudaRasterizer::Rasterizer::backward(
 	char* binning_buffer,
 	char* img_buffer,
 	const float* dL_dpix,
+	const float* dL_dsemantic,
 	float* dL_dmean2D,
 	float* dL_dconic,
 	float* dL_dopacity,
 	float* dL_dcolor,
+	float* dL_dsemantic_precomp,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
 	float* dL_dsh,
@@ -465,6 +487,24 @@ void CudaRasterizer::Rasterizer::backward(
 		(float4*)dL_dconic,
 		dL_dopacity,
 		dL_dcolor), debug)
+
+	if (semantic_precomp != nullptr && semantic_dim > 0 && dL_dsemantic != nullptr && dL_dsemantic_precomp != nullptr)
+	{
+		CHECK_CUDA(BACKWARD::render_semantic(
+			tile_grid,
+			block,
+			imgState.ranges,
+			binningState.point_list,
+			width, height,
+			geomState.means2D,
+			geomState.conic_opacity,
+			semantic_precomp,
+			semantic_dim,
+			imgState.accum_alpha,
+			imgState.n_contrib,
+			dL_dsemantic,
+			dL_dsemantic_precomp), debug)
+	}
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,

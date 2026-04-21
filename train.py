@@ -21,6 +21,7 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 
 
 import torch
+import torch.nn.functional as F
 import torchvision
 import json
 import wandb
@@ -79,16 +80,73 @@ def saveRuntimeCode(dst: str) -> None:
     print('Backup Finished!')
 
 
+def build_gaussian_model(dataset):
+    return GaussianModel(
+        dataset.feat_dim,
+        dataset.n_offsets,
+        dataset.voxel_size,
+        dataset.update_depth,
+        dataset.update_init_factor,
+        dataset.update_hierachy_factor,
+        dataset.use_feat_bank,
+        dataset.appearance_dim,
+        dataset.ratio,
+        dataset.add_opacity_dist,
+        dataset.add_cov_dist,
+        dataset.add_color_dist,
+        semantic_dim=dataset.semantic_dim,
+        add_semantic_dist=False,
+    )
+
+
+def resolve_semantic_feature_root(dataset):
+    if os.path.isabs(dataset.semantic_features_name):
+        return dataset.semantic_features_name
+    return os.path.join(dataset.source_path, dataset.semantic_features_name)
+
+
+def compute_semantic_loss(prediction, target, mask, loss_type):
+    mask = mask.to(prediction.dtype)
+    valid = mask.sum().clamp_min(1.0)
+
+    if loss_type == "cosine":
+        prediction = F.normalize(prediction, dim=0)
+        target = F.normalize(target, dim=0)
+        per_pixel_loss = 1.0 - torch.sum(prediction * target, dim=0, keepdim=True)
+        return (per_pixel_loss * mask).sum() / valid
+    if loss_type == "l1":
+        return (torch.abs(prediction - target) * mask).sum() / (valid * prediction.shape[0])
+    if loss_type == "l2":
+        return (((prediction - target) ** 2) * mask).sum() / (valid * prediction.shape[0])
+
+    raise ValueError(f"Unsupported semantic loss type: {loss_type}")
+
+
+def apply_semantic_training_mode(gaussians, opt):
+    if not (opt.freeze_rgb_branch or opt.semantic_only):
+        return
+
+    trainable_names = {"mlp_semantic"}
+    for group in gaussians.optimizer.param_groups:
+        should_train = group["name"] in trainable_names
+        if not should_train:
+            group["lr"] = 0.0
+        for param in group["params"]:
+            param.requires_grad_(should_train)
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    use_semantic_supervision = dataset.include_semantic or opt.semantic_only
+    setattr(opt, "train_semantic", use_semantic_supervision)
+    gaussians = build_gaussian_model(dataset)
     scene = Scene(dataset, gaussians, ply_path=ply_path, shuffle=False)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+    apply_semantic_training_mode(gaussians, opt)
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -96,6 +154,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    semantic_feature_root = resolve_semantic_feature_root(dataset)
+    if use_semantic_supervision and not os.path.isdir(semantic_feature_root):
+        raise FileNotFoundError(f"Semantic features not found: {semantic_feature_root}")
+    if opt.freeze_rgb_branch and not use_semantic_supervision:
+        raise ValueError("--freeze_rgb_branch requires --include_semantic or --semantic_only")
+    if logger is not None:
+        if use_semantic_supervision:
+            logger.info(f"Semantic supervision enabled from {semantic_feature_root}")
+        else:
+            logger.info("Semantic supervision disabled; semantic feature directory not found or flag not set.")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
@@ -106,7 +176,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 net_image_bytes = None
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                    net_image = render(
+                        custom_cam,
+                        gaussians,
+                        pipe,
+                        background,
+                        scaling_modifer,
+                        render_semantic=use_semantic_supervision,
+                    )["render"]
                     net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
@@ -117,9 +194,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
-
-        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         
         # Pick a random Camera
@@ -133,16 +207,47 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, visible_mask=voxel_visible_mask, retain_grad=retain_grad)
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            visible_mask=voxel_visible_mask,
+            retain_grad=retain_grad,
+            render_semantic=use_semantic_supervision,
+        )
         
-        image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        image = render_pkg["render"]
+        semantic_feature_image = render_pkg["semantic_feature_image"]
+        viewspace_point_tensor = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        offset_selection_mask = render_pkg["selection_mask"]
+        radii = render_pkg["radii"]
+        scaling = render_pkg["scaling"]
+        opacity = render_pkg["neural_opacity"]
 
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-
         ssim_loss = (1.0 - ssim(image, gt_image))
         scaling_reg = scaling.prod(dim=1).mean()
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
+        if opt.semantic_only:
+            loss = 0.01 * scaling_reg
+        else:
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01 * scaling_reg
+
+        semantic_loss = None
+        if use_semantic_supervision:
+            gt_semantic_feature, semantic_mask = viewpoint_cam.get_language_feature(
+                semantic_feature_root,
+                feature_level=dataset.feature_level,
+            )
+            semantic_loss = compute_semantic_loss(
+                semantic_feature_image,
+                gt_semantic_feature,
+                semantic_mask,
+                "l1",
+            )
+            loss = loss + opt.semantic_loss_weight * semantic_loss
 
         loss.backward()
         
@@ -159,20 +264,35 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
+            training_report(
+                tb_writer,
+                dataset_name,
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                wandb,
+                logger,
+                semantic_loss=semantic_loss,
+            )
             if (iteration in saving_iterations):
                 logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
             
             # densification
-            if iteration < opt.update_until and iteration > opt.start_stat:
+            if (not opt.freeze_rgb_branch) and (not opt.semantic_only) and iteration < opt.update_until and iteration > opt.start_stat:
                 # add statis
                 gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
                 
                 # densification
                 if iteration > opt.update_from and iteration % opt.update_interval == 0:
                     gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity)
-            elif iteration == opt.update_until:
+            elif (not opt.freeze_rgb_branch) and (not opt.semantic_only) and iteration == opt.update_until:
                 del gaussians.opacity_accum
                 del gaussians.offset_gradient_accum
                 del gaussians.offset_denom
@@ -208,15 +328,20 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None):
+def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, semantic_loss=None):
     if tb_writer:
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
+        if semantic_loss is not None:
+            tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/semantic_loss', semantic_loss.item(), iteration)
 
 
     if wandb is not None:
-        wandb.log({"train_l1_loss":Ll1, 'train_total_loss':loss, })
+        log_payload = {"train_l1_loss": Ll1, "train_total_loss": loss}
+        if semantic_loss is not None:
+            log_payload["train_semantic_loss"] = semantic_loss
+        wandb.log(log_payload)
     
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -279,9 +404,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    semantic_path = os.path.join(model_path, name, "ours_{}".format(iteration), "semantic")
     makedirs(render_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    if getattr(pipeline, "render_semantic", False):
+        makedirs(semantic_path, exist_ok=True)
     
     t_list = []
     visible_count_list = []
@@ -292,7 +420,14 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize();t_start = time.time()
         
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask)
+        render_pkg = render(
+            view,
+            gaussians,
+            pipeline,
+            background,
+            visible_mask=voxel_visible_mask,
+            render_semantic=getattr(pipeline, "render_semantic", False),
+        )
         torch.cuda.synchronize();t_end = time.time()
 
         t_list.append(t_end - t_start)
@@ -314,6 +449,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        if getattr(pipeline, "render_semantic", False) and render_pkg["semantic_feature_image"] is not None:
+            semantic_latent = render_pkg["semantic_feature_image"].permute(1, 2, 0).detach().cpu().numpy()
+            np.save(os.path.join(semantic_path, '{0:05d}'.format(idx) + ".npy"), semantic_latent)
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
     
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
@@ -323,8 +461,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+        gaussians = build_gaussian_model(dataset)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
         gaussians.eval()
 
@@ -522,20 +659,21 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    pipeline_args = pp.extract(args)
     
     # training
-    training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
+    training(lp.extract(args), op.extract(args), pipeline_args, dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger)
     if args.warmup:
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
+        training(lp.extract(args), op.extract(args), pipeline_args, dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path)
 
     # All done
     logger.info("\nTraining complete.")
 
     # rendering
     logger.info(f'\nStarting Rendering~')
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
+    visible_count = render_sets(lp.extract(args), -1, pipeline_args, wandb=wandb, logger=logger)
     logger.info("\nRendering complete.")
 
     # calc metrics
