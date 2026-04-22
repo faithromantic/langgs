@@ -1,4 +1,5 @@
 *.pyc
+*.pyo
 .vscode
 temp*
 outputs*
@@ -15,3 +16,21 @@ diff_rasterization/dist
 tensorboard_3d
 screenshots
 *.so
+*.pyd
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.bin
+.pycache_tmp/
+__pycache__/
+build/
+dist/
+*.egg-info/
+playroom/
+test/
+tests/data/
+language_features/
+language_features_*/
+language_feature*.json
