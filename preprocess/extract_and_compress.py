@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
@@ -23,6 +24,14 @@ from model import FeatureAutoEncoder
 # Utils
 # -----------------------------
 IMG_EXTS = [".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"]
+
+
+def ensure_segment_anything_on_path() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    sam_root = repo_root / "third_party" / "segment-anything"
+    sam_root_str = str(sam_root)
+    if sam_root.exists() and sam_root_str not in sys.path:
+        sys.path.insert(0, sam_root_str)
 
 
 def list_images(image_dir: str) -> List[str]:
@@ -59,6 +68,7 @@ def save_json(obj: dict, path: str):
 #   2) fallback to multi-scale grid regions
 # -----------------------------
 def build_sam_generator(sam_ckpt: str, sam_type: str = "vit_h"):
+    ensure_segment_anything_on_path()
     from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
     sam = sam_model_registry[sam_type](checkpoint=sam_ckpt)
     sam.cuda().eval()

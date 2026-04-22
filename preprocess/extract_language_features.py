@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -15,6 +16,14 @@ import open_clip
 
 IMG_EXTS = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
 LEVEL_NAMES = ("default", "s", "m", "l")
+
+
+def ensure_segment_anything_on_path() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    sam_root = repo_root / "third_party" / "segment-anything"
+    sam_root_str = str(sam_root)
+    if sam_root.exists() and sam_root_str not in sys.path:
+        sys.path.insert(0, sam_root_str)
 
 
 def list_images(image_dir: Path) -> List[Path]:
@@ -64,6 +73,7 @@ class CLIPRegionEncoder:
 
 
 def build_sam_generator(sam_ckpt: str, sam_type: str):
+    ensure_segment_anything_on_path()
     from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
 
     sam = sam_model_registry[sam_type](checkpoint=sam_ckpt)
